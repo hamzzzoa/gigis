@@ -1,0 +1,1242 @@
+--!strict
+-- ToggleBus — bus event client-side, pengganti _G.ToggleBus
+-- Pakai:
+--   ToggleBus.toggle("Parry", true)
+--   ToggleBus.onToggle(function(feature, state) ... end)
+
+local ToggleBus = {}
+local signal = Instance.new("BindableEvent")
+
+function ToggleBus.toggle(feature: string, state: boolean)
+	signal:Fire(feature, state)
+end
+
+function ToggleBus.onToggle(callback: (string, boolean) -> ())
+	return signal.Event:Connect(callback)
+end
+
+return ToggleBus--!strict
+-- ParryAPI — state parry per pemain. HANYA untuk server.
+-- Karena ada di ServerStorage, client tidak bisa baca/modifikasi.
+
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local Config = require(ReplicatedStorage.Modules.Config)
+
+type State = { lastParry: number, activeUntil: number }
+
+local ParryAPI = {}
+local parryState: {[Player]: State} = {}
+local lastRemoteAt: {[Player]: number} = {}
+
+local REMOTE_RATE = 0.1 -- anti-spam remote
+
+local function getState(p: Player): State
+	if not parryState[p] then
+		parryState[p] = { lastParry = 0, activeUntil = 0 }
+	end
+	return parryState[p]
+end
+
+function ParryAPI.tryParry(player: Player): boolean
+	local now = os.clock()
+
+	-- Rate limit
+	if now - (lastRemoteAt[player] or 0) < REMOTE_RATE then return false end
+	lastRemoteAt[player] = now
+
+	-- Karakter hidup?
+	local char = player.Character
+	if not char then return false end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return false end
+
+	-- Cooldown
+	local state = getState(player)
+	if now - state.lastParry < Config.Parry.COOLDOWN then return false end
+
+	-- Terima parry
+	state.lastParry = now
+	state.activeUntil = now + Config.Parry.WINDOW
+	return true
+end
+
+function ParryAPI.isParrying(player: Player, now: number?): boolean
+	local state = parryState[player]
+	if not state then return false end
+	return (now or os.clock()) <= state.activeUntil
+end
+
+Players.PlayerRemoving:Connect(function(p)
+	parryState[p] = nil
+	lastRemoteAt[p] = nil
+end)
+
+return ParryAPI--!strict
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local ParryRequest = Remotes:WaitForChild("ParryRequest")
+local ParryAPI = require(ServerStorage.Modules.ParryAPI)
+
+ParryRequest.OnServerEvent:Connect(function(player)
+	ParryAPI.tryParry(player)
+end)--!strict
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage = game:GetService("ServerStorage")
+local Players = game:GetService("Players")
+
+local Config = require(ReplicatedStorage.Modules.Config)
+local ParryAPI = require(ServerStorage.Modules.ParryAPI)
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local AttackRequest = Remotes:WaitForChild("AttackRequest")
+
+local lastAttackAt: {[Player]: number} = {}
+
+local function getHRP(p: Player): BasePart?
+	local c = p.Character
+	if not c then return nil end
+	return c:FindFirstChild("HumanoidRootPart") :: BasePart?
+end
+
+local function tryDamage(attacker: Player, target: Player, damage: number): string
+	local targetHRP = getHRP(target)
+	local attackerHRP = getHRP(attacker)
+	if not targetHRP or not attackerHRP then return "invalid" end
+
+	local dist = (targetHRP.Position - attackerHRP.Position).Magnitude
+	if dist > Config.Combat.ATTACK_RANGE then return "invalid" end
+
+	local now = os.clock()
+
+	if ParryAPI.isParrying(target, now) then
+		if dist <= Config.Parry.MAX_DISTANCE then
+			print(("[Parry] %s parry serangan %s"):format(target.Name, attacker.Name))
+			return "parried"
+		end
+	end
+
+	local hum = target.Character and target.Character:FindFirstChildOfClass("Humanoid")
+	if hum then hum:TakeDamage(damage) end
+	return "hit"
+end
+
+AttackRequest.OnServerEvent:Connect(function(player, target)
+	-- Validasi tipe (client bisa kirim apa saja)
+	if typeof(target) ~= "Instance" then return end
+	if not target:IsA("Model") then return end
+
+	-- Rate limit
+	local now = os.clock()
+	if now - (lastAttackAt[player] or 0) < Config.Combat.ATTACK_COOLDOWN then return end
+	lastAttackAt[player] = now
+
+	-- Harus karakter pemain lain
+	local targetPlayer = Players:GetPlayerFromCharacter(target)
+	if not targetPlayer or targetPlayer == player then return end
+
+	local hum = target:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return end
+
+	tryDamage(player, targetPlayer, Config.Combat.BASE_DAMAGE)
+end)
+
+Players.PlayerRemoving:Connect(function(p)
+	lastAttackAt[p] = nil
+end)--!strict
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local AttackRequest = Remotes:WaitForChild("AttackRequest")
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if input.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+
+	local mouse = player:GetMouse()
+	local target = mouse.Target
+	if not target then return end
+
+	-- Cari karakter (Model dengan Humanoid)
+	local character = target:FindFirstAncestorOfClass("Model")
+	if not character or not character:FindFirstChildOfClass("Humanoid") then return end
+	if character == player.Character then return end
+
+	AttackRequest:FireServer(character) -- hanya kirim "niat"
+end)--!strict
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config = require(ReplicatedStorage.Modules.Config)
+local ToggleBus = require(ReplicatedStorage.Modules.ToggleBus)
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- Zoom max (fitur resmi Roblox, legal)
+player.CameraMaxZoomDistance = 1000
+player.CameraMinZoomDistance = 0.5
+
+------------------------------------------------------------
+-- ScreenGui
+------------------------------------------------------------
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "MyGameGUI"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = playerGui
+
+------------------------------------------------------------
+-- Frame utama
+------------------------------------------------------------
+local MAIN_SIZE = UDim2.fromOffset(320, 440)
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+mainFrame.Size = MAIN_SIZE
+mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+mainFrame.BackgroundColor3 = Config.GUI.COLOR_MAIN
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Parent = screenGui
+
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 10)
+local pad = Instance.new("UIPadding", mainFrame)
+pad.PaddingTop, pad.PaddingBottom = UDim.new(0, 8), UDim.new(0, 8)
+pad.PaddingLeft, pad.PaddingRight = UDim.new(0, 8), UDim.new(0, 8)
+
+------------------------------------------------------------
+-- Judul
+------------------------------------------------------------
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -40, 0, 28)
+title.BackgroundTransparency = 1
+title.Font = Config.GUI.FONT
+title.Text = "🎮 My Game Panel"
+title.TextColor3 = Config.GUI.COLOR_TEXT
+title.TextSize = 18
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = mainFrame
+
+------------------------------------------------------------
+-- Tombol X
+------------------------------------------------------------
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.fromOffset(28, 28)
+closeBtn.Position = UDim2.new(1, -28, 0, 0)
+closeBtn.BackgroundColor3 = Config.GUI.COLOR_CLOSE
+closeBtn.Text = "X"
+closeBtn.Font = Config.GUI.FONT
+closeBtn.TextColor3 = Config.GUI.COLOR_TEXT
+closeBtn.TextSize = 16
+closeBtn.BorderSizePixel = 0
+closeBtn.Parent = mainFrame
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+------------------------------------------------------------
+-- Tombol reopen
+------------------------------------------------------------
+local OPEN_SIZE = UDim2.fromOffset(60, 60)
+
+local openBtn = Instance.new("TextButton")
+openBtn.Size = OPEN_SIZE
+openBtn.Position = UDim2.new(0, 15, 0, 15)
+openBtn.BackgroundColor3 = Config.GUI.COLOR_MAIN
+openBtn.Text = "☰"
+openBtn.Font = Config.GUI.FONT
+openBtn.TextColor3 = Config.GUI.COLOR_TEXT
+openBtn.TextSize = 28
+openBtn.Visible = false
+openBtn.BorderSizePixel = 0
+openBtn.Parent = screenGui
+Instance.new("UICorner", openBtn).CornerRadius = UDim.new(0, 8)
+
+------------------------------------------------------------
+-- Tween
+------------------------------------------------------------
+local TWEEN_INFO = TweenInfo.new(0.25, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+
+local function hideMainFrame()
+	mainFrame.Visible = false
+	openBtn.Visible = true
+	openBtn.Size = UDim2.fromOffset(0, 0)
+	TweenService:Create(openBtn, TWEEN_INFO, { Size = OPEN_SIZE }):Play()
+end
+
+local function showMainFrame()
+	openBtn.Visible = false
+	mainFrame.Visible = true
+	mainFrame.Size = UDim2.fromOffset(0, 0)
+	TweenService:Create(mainFrame, TWEEN_INFO, { Size = MAIN_SIZE }):Play()
+end
+
+closeBtn.MouseButton1Click:Connect(hideMainFrame)
+openBtn.MouseButton1Click:Connect(showMainFrame)
+
+------------------------------------------------------------
+-- Toggle buttons
+------------------------------------------------------------
+local toggleState = { Parry = false, ESP = false, InstantGen = false }
+
+local function makeToggle(name: string, yOffset: number): TextButton
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, 0, 0, 36)
+	btn.Position = UDim2.new(0, 0, 0, 40 + yOffset)
+	btn.BackgroundColor3 = Config.GUI.COLOR_ACCENT
+	btn.Text = ("%s: OFF"):format(name)
+	btn.Font = Config.GUI.FONT
+	btn.TextColor3 = Config.GUI.COLOR_TEXT
+	btn.TextSize = 14
+	btn.BorderSizePixel = 0
+	btn.Parent = mainFrame
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+	return btn
+end
+
+local parryBtn = makeToggle("Auto Parry", 0)
+local espBtn   = makeToggle("Debug ESP", 40)
+local genBtn   = makeToggle("Instant Generator", 80)
+
+local function updateToggle(btn: TextButton, name: string, state: boolean)
+	btn.Text = ("%s: %s"):format(name, state and "ON" or "OFF")
+	TweenService:Create(btn, TWEEN_INFO, {
+		BackgroundColor3 = state
+			and Color3.fromRGB(60, 200, 100)
+			or Config.GUI.COLOR_ACCENT
+	}):Play()
+end
+
+parryBtn.MouseButton1Click:Connect(function()
+	toggleState.Parry = not toggleState.Parry
+	updateToggle(parryBtn, "Auto Parry", toggleState.Parry)
+	ToggleBus.toggle("Parry", toggleState.Parry)
+end)
+
+espBtn.MouseButton1Click:Connect(function()
+	toggleState.ESP = not toggleState.ESP
+	updateToggle(espBtn, "Debug ESP", toggleState.ESP)
+	ToggleBus.toggle("ESP", toggleState.ESP)
+end)
+
+genBtn.MouseButton1Click:Connect(function()
+	toggleState.InstantGen = not toggleState.InstantGen
+	updateToggle(genBtn, "Instant Generator", toggleState.InstantGen)
+	ToggleBus.toggle("InstantGen", toggleState.InstantGen)
+end)
+
+------------------------------------------------------------
+-- Drag manual
+------------------------------------------------------------
+local dragging, dragStart, startPos
+
+title.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = mainFrame.Position
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+			end
+		end)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch) then
+		local delta = input.Position - dragStart
+		mainFrame.Position = UDim2.new(
+			startPos.X.Scale, startPos.X.Offset + delta.X,
+			startPos.Y.Scale, startPos.Y.Offset + delta.Y
+		)
+	end
+end)--!strict
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+
+local ToggleBus = require(ReplicatedStorage.Modules.ToggleBus)
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local ParryRequest = Remotes:WaitForChild("ParryRequest")
+
+local autoParry = false
+
+ToggleBus.onToggle(function(feature, state)
+	if feature == "Parry" then
+		autoParry = state
+	end
+end)
+
+-- Manual: tekan F
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if input.KeyCode == Enum.KeyCode.F then
+		ParryRequest:FireServer()
+	end
+end)
+
+-- Auto parry loop
+task.spawn(function()
+	while true do
+		task.wait(0.15)
+		if autoParry then
+			ParryRequest:FireServer()
+		end
+	end
+end)--!strict
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+
+local Config = require(ReplicatedStorage.Modules.Config)
+local ToggleBus = require(ReplicatedStorage.Modules.ToggleBus)
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local GeneratorAction = Remotes:WaitForChild("GeneratorAction")
+
+local instantMode = false
+ToggleBus.onToggle(function(feature, state)
+	if feature == "InstantGen" then
+		instantMode = state
+	end
+end)
+
+local function interact(part: Instance, action: string)
+	GeneratorAction:FireServer(action, part)
+end
+
+------------------------------------------------------------
+-- Progress Bar (BillboardGui di atas generator)
+------------------------------------------------------------
+local function createBillboard(part: BasePart): BillboardGui
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "GenProgress"
+	bb.Size = UDim2.fromOffset(120, 30)
+	bb.StudsOffsetWorldSpace = Vector3.new(0, 3.5, 0)
+	bb.AlwaysOnTop = true
+	bb.MaxDistance = 120
+	bb.Adornee = part
+	bb.Parent = part
+
+	local bg = Instance.new("Frame")
+	bg.Size = UDim2.fromScale(1, 0.5)
+	bg.Position = UDim2.fromScale(0, 0.5)
+	bg.AnchorPoint = Vector2.new(0, 0.5)
+	bg.BackgroundColor3 = Color3.fromRGB(30, 30, 40)
+	bg.BorderSizePixel = 0
+	bg.Parent = bb
+	Instance.new("UICorner", bg).CornerRadius = UDim.new(1, 0)
+
+	local fill = Instance.new("Frame")
+	fill.Name = "Fill"
+	fill.Size = UDim2.fromScale(0, 1)
+	fill.BackgroundColor3 = Config.GUI.COLOR_ACCENT
+	fill.BorderSizePixel = 0
+	fill.Parent = bg
+	Instance.new("UICorner", fill).CornerRadius = UDim.new(1, 0)
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.Size = UDim2.fromScale(1, 0.4)
+	label.Position = UDim2.fromScale(0, 0)
+	label.AnchorPoint = Vector2.new(0, 1)
+	label.BackgroundTransparency = 1
+	label.Font = Config.GUI.FONT
+	label.TextColor3 = Config.GUI.COLOR_TEXT
+	label.TextStrokeTransparency = 0.5
+	label.TextSize = 12
+	label.Text = "0%"
+	label.Parent = bb
+
+	local function update()
+		local progress = part:GetAttribute("Progress") or 0
+		local active   = part:GetAttribute("Active") or false
+		local pct = math.clamp(progress / Config.Generator.FINISH_TIME, 0, 1)
+
+		TweenService:Create(fill, TweenInfo.new(0.2), {
+			Size = UDim2.fromScale(pct, 1)
+		}):Play()
+
+		label.Text = ("%d%%"):format(math.floor(pct * 100))
+		bb.Enabled = active or (pct > 0 and pct < 1)
+
+		if pct >= 1 then
+			task.delay(1.5, function()
+				if bb.Parent then bb.Enabled = false end
+			end)
+		end
+	end
+
+	part:GetAttributeChangedSignal("Progress"):Connect(update)
+	part:GetAttributeChangedSignal("Active"):Connect(update)
+	update()
+
+	return bb
+end
+
+------------------------------------------------------------
+-- Setup prompt + billboard
+------------------------------------------------------------
+local function setupPrompt(part: BasePart)
+	if part:FindFirstChildOfClass("ProximityPrompt") then return end
+
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.ActionText = "Aktifkan"
+	prompt.ObjectText = "Generator"
+	prompt.HoldDuration = 0
+	prompt.MaxActivationDistance = 10
+	prompt.RequiresLineOfSight = false
+	prompt.Parent = part
+
+	prompt.Triggered:Connect(function()
+		interact(part, instantMode and "instant" or "start")
+	end)
+	prompt.TriggerEnded:Connect(function()
+		if not instantMode then interact(part, "stop") end
+	end)
+
+	createBillboard(part)
+end
+
+------------------------------------------------------------
+-- Scan workspace
+------------------------------------------------------------
+local function scan()
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		if obj:IsA("BasePart") and obj:HasTag("Generator") then
+			setupPrompt(obj)
+		end
+	end
+end
+
+scan()
+workspace.DescendantAdded:Connect(function(obj)
+	if obj:IsA("BasePart") and obj:HasTag("Generator") then
+		setupPrompt(obj)
+	end
+end)--!strict
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config = require(ReplicatedStorage.Modules.Config)
+local ToggleBus = require(ReplicatedStorage.Modules.ToggleBus)
+
+local player = Players.LocalPlayer
+if not Config.DEV_BIMZ_IDS[player.UserId] then return end
+
+local enabled = false
+local activeHighlights: {[Instance]: Highlight} = {}
+
+local function addHighlight(instance: Instance, color: Color3)
+	if activeHighlights[instance] then return end
+	local hl = Instance.new("Highlight")
+	hl.Adornee = instance
+	hl.FillColor = color
+	hl.OutlineColor = Color3.new(1, 1, 1)
+	hl.FillTransparency = 0.5
+	hl.OutlineTransparency = 0
+	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	hl.Parent = instance
+	activeHighlights[instance] = hl
+end
+
+local function clearAll()
+	for inst, hl in pairs(activeHighlights) do
+		hl:Destroy()
+		activeHighlights[inst] = nil
+	end
+end
+
+local function scanAndTag()
+	for inst, hl in pairs(activeHighlights) do
+		if not inst.Parent then
+			hl:Destroy()
+			activeHighlights[inst] = nil
+		end
+	end
+	for _, obj in ipairs(Workspace:GetDescendants()) do
+		local color = Config.DebugHighlight.COLORS[obj.Name]
+		if color and (obj:IsA("Model") or obj:IsA("BasePart")) then
+			addHighlight(obj, color)
+		end
+	end
+end
+
+ToggleBus.onToggle(function(feature, state)
+	if feature == "ESP" then
+		enabled = state
+		if enabled then scanAndTag() else clearAll() end
+	end
+end)
+
+task.spawn(function()
+	while true do
+		task.wait(2)
+		if enabled then scanAndTag() end
+	end
+end)--!strict
+-- Config.lua — semua konstanta game di satu tempat.
+
+local Config = {}
+
+-- ⚠️ GANTI dengan UserId Roblox kamu (untuk fitur dev-only)
+-- Cara cek UserId: buka profil Roblox kamu, lihat angka di URL.
+-- Contoh: roblox.com/users/123456789/profile → UserId = 123456789
+Config.DEV_BIMZ_IDS = {
+	[123456789] = true, -- <-- ganti dengan UserId BIMZ
+}
+
+Config.Parry = {
+	WINDOW       = 0.35,
+	COOLDOWN     = 0.9,
+	MAX_DISTANCE = 12,
+}
+
+Config.Combat = {
+	BASE_DAMAGE     = 25,
+	ATTACK_RANGE    = 10,
+	ATTACK_COOLDOWN = 0.6,
+}
+
+Config.Generator = {
+	FINISH_TIME       = 20,
+	INTERACT_RANGE    = 10,
+	PROGRESS_PER_TICK = 1,
+	TICK_RATE         = 0.25,
+}
+
+Config.GUI = {
+	COLOR_MAIN   = Color3.fromRGB(28, 78, 180),
+	COLOR_ACCENT = Color3.fromRGB(60, 130, 240),
+	COLOR_CLOSE  = Color3.fromRGB(220, 60, 60),
+	COLOR_TEXT   = Color3.fromRGB(255, 255, 255),
+	FONT         = Enum.Font.GothamBold,
+}
+
+Config.DebugHighlight = {
+	COLORS = {
+		NPC       = Color3.fromRGB(80, 220, 100),
+		Generator = Color3.fromRGB(255, 220, 60),
+		Pallet    = Color3.fromRGB(80, 160, 255),
+		Chest     = Color3.fromRGB(255, 120, 200),
+	},
+}
+
+return Config--!strict
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Config"))
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+------------------------------------------------------------
+-- BindableEvent global agar script lain bisa toggle fitur
+------------------------------------------------------------
+local toggleBus = Instance.new("BindableEvent")
+toggleBus.Name = "ToggleBus"
+toggleBus.Parent = script
+_G.ToggleBus = toggleBus  -- sederhana; di produksi pakai ModuleScript
+
+------------------------------------------------------------
+-- ScreenGui
+------------------------------------------------------------
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "MyGameGUI"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = playerGui
+
+------------------------------------------------------------
+-- Frame utama
+------------------------------------------------------------
+local mainFrame = Instance.new("Frame")
+mainFrame.Name = "MainFrame"
+mainFrame.Size = UDim2.fromOffset(320, 440)
+mainFrame.Position = UDim2.new(0.5, -160, 0.5, -220)
+mainFrame.BackgroundColor3 = Config.GUI.COLOR_MAIN
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Parent = screenGui
+
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 10)
+local pad = Instance.new("UIPadding", mainFrame)
+pad.PaddingTop, pad.PaddingBottom = UDim.new(0, 8), UDim.new(0, 8)
+pad.PaddingLeft, pad.PaddingRight = UDim.new(0, 8), UDim.new(0, 8)
+
+------------------------------------------------------------
+-- Judul
+------------------------------------------------------------
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -40, 0, 28)
+title.BackgroundTransparency = 1
+title.Font = Config.GUI.FONT
+title.Text = "🎮 My Game Panel"
+title.TextColor3 = Config.GUI.COLOR_TEXT
+title.TextSize = 18
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = mainFrame
+
+------------------------------------------------------------
+-- Tombol X
+------------------------------------------------------------
+local closeBtn = Instance.new("TextButton")
+closeBtn.Size = UDim2.fromOffset(28, 28)
+closeBtn.Position = UDim2.new(1, -28, 0, 0)
+closeBtn.BackgroundColor3 = Config.GUI.COLOR_CLOSE
+closeBtn.Text = "X"
+closeBtn.Font = Config.GUI.FONT
+closeBtn.TextColor3 = Config.GUI.COLOR_TEXT
+closeBtn.TextSize = 16
+closeBtn.BorderSizePixel = 0
+closeBtn.Parent = mainFrame
+Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 6)
+
+------------------------------------------------------------
+-- Tombol reopen
+------------------------------------------------------------
+local openBtn = Instance.new("TextButton")
+openBtn.Size = UDim2.fromOffset(60, 60)
+openBtn.Position = UDim2.new(0, 15, 0, 15)
+openBtn.BackgroundColor3 = Config.GUI.COLOR_MAIN
+openBtn.Text = "☰"
+openBtn.Font = Config.GUI.FONT
+openBtn.TextColor3 = Config.GUI.COLOR_TEXT
+openBtn.TextSize = 28
+openBtn.Visible = false
+openBtn.BorderSizePixel = 0
+openBtn.Parent = screenGui
+Instance.new("UICorner", openBtn).CornerRadius = UDim.new(0, 8)
+
+closeBtn.MouseButton1Click:Connect(function()
+	mainFrame.Visible = false
+	openBtn.Visible = true
+end)
+openBtn.MouseButton1Click:Connect(function()
+	mainFrame.Visible = true
+	openBtn.Visible = false
+end)
+
+------------------------------------------------------------
+-- Tombol Toggle Fitur
+------------------------------------------------------------
+local toggleState = {
+	Parry = false,
+	ESP = false,
+	InstantGen = false,
+}
+
+local function makeToggle(name: string, yOffset: number): TextButton
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(1, 0, 0, 36)
+	btn.Position = UDim2.new(0, 0, 0, 40 + yOffset)
+	btn.BackgroundColor3 = Config.GUI.COLOR_ACCENT
+	btn.Text = ("%s: OFF"):format(name)
+	btn.Font = Config.GUI.FONT
+	btn.TextColor3 = Config.GUI.COLOR_TEXT
+	btn.TextSize = 14
+	btn.BorderSizePixel = 0
+	btn.Parent = mainFrame
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+	return btn
+end
+
+local parryBtn = makeToggle("Auto Parry", 0)
+local espBtn   = makeToggle("Debug ESP", 40)
+local genBtn   = makeToggle("Instant Generator", 80)
+
+local function updateToggle(btn: TextButton, name: string, state: boolean)
+	btn.Text = ("%s: %s"):format(name, state and "ON" or "OFF")
+	btn.BackgroundColor3 = state
+		and Color3.fromRGB(60, 200, 100)
+		or Config.GUI.COLOR_ACCENT
+end
+
+parryBtn.MouseButton1Click:Connect(function()
+	toggleState.Parry = not toggleState.Parry
+	updateToggle(parryBtn, "Auto Parry", toggleState.Parry)
+	toggleBus:Fire("Parry", toggleState.Parry)
+end)
+
+espBtn.MouseButton1Click:Connect(function()
+	toggleState.ESP = not toggleState.ESP
+	updateToggle(espBtn, "Debug ESP", toggleState.ESP)
+	toggleBus:Fire("ESP", toggleState.ESP)
+end)
+
+genBtn.MouseButton1Click:Connect(function()
+	toggleState.InstantGen = not toggleState.InstantGen
+	updateToggle(genBtn, "Instant Generator", toggleState.InstantGen)
+	toggleBus:Fire("InstantGen", toggleState.InstantGen)
+end)
+
+------------------------------------------------------------
+-- Drag manual (support UICorner)
+------------------------------------------------------------
+local dragging, dragStart, startPos
+
+title.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = mainFrame.Position
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+			end
+		end)
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch) then
+		local delta = input.Position - dragStart
+		mainFrame.Position = UDim2.new(
+			startPos.X.Scale, startPos.X.Offset + delta.X,
+			startPos.Y.Scale, startPos.Y.Offset + delta.Y
+		)
+	end
+end)--!strict
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local ParryRequest = Remotes:WaitForChild("ParryRequest")
+
+local autoParry = false
+
+-- Dengarkan toggle dari GUI
+task.spawn(function()
+	while not _G.ToggleBus do task.wait(0.1) end
+	_G.ToggleBus.Event:Connect(function(feature, state)
+		if feature == "Parry" then
+			autoParry = state
+		end
+	end)
+end)
+
+------------------------------------------------------------
+-- Manual parry: tekan F
+------------------------------------------------------------
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if input.KeyCode == Enum.KeyCode.F then
+		ParryRequest:FireServer()
+	end
+end)
+
+------------------------------------------------------------
+-- Auto Parry: spam aman ke server (server yang validasi cooldown)
+------------------------------------------------------------
+task.spawn(function()
+	while true do
+		task.wait(0.15) -- jangan terlalu cepat; server punya rate limit
+		if autoParry then
+			ParryRequest:FireServer()
+		end
+	end
+end)--!strict
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local Config = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Config"))
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local ParryRequest = Remotes:WaitForChild("ParryRequest")
+
+type State = { lastParry: number, activeUntil: number }
+local parryState: {[Player]: State} = {}
+local lastRemoteAt: {[Player]: number} = {}
+
+local REMOTE_RATE = 0.1 -- server tolak jika < 0.1s
+
+local function getState(p: Player): State
+	if not parryState[p] then
+		parryState[p] = { lastParry = 0, activeUntil = 0 }
+	end
+	return parryState[p]
+end
+
+ParryRequest.OnServerEvent:Connect(function(player)
+	-- Rate limit remote
+	local now = os.clock()
+	if now - (lastRemoteAt[player] or 0) < REMOTE_RATE then return end
+	lastRemoteAt[player] = now
+
+	-- Karakter hidup?
+	local char = player.Character
+	if not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	if not hum or hum.Health <= 0 then return end
+
+	-- Cooldown
+	local state = getState(player)
+	if now - state.lastParry < Config.Parry.COOLDOWN then return end
+
+	state.lastParry = now
+	state.activeUntil = now + Config.Parry.WINDOW
+end)
+
+-- API publik untuk CombatSystem (dipanggil sebagai ModuleScript idealnya)
+local ParryAPI = {}
+
+function ParryAPI.isParrying(player: Player, now: number): boolean
+	local state = parryState[player]
+	return state ~= nil and now <= state.activeUntil
+end
+
+function ParryAPI.getWindow(): number
+	return Config.Parry.WINDOW
+end
+
+-- Simpan API global (sederhana; di produksi buat ModuleScript)
+_G.ParryAPI = ParryAPI
+
+Players.PlayerRemoving:Connect(function(p)
+	parryState[p] = nil
+	lastRemoteAt[p] = nil
+end)t--!strict
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local Config = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Config"))
+
+-- Tunggu ParryServer siap
+repeat task.wait() until _G.ParryAPI
+local ParryAPI = _G.ParryAPI
+
+local function getHRP(player: Player): BasePart?
+	local char = player.Character
+	if not char then return nil end
+	return char:FindFirstChild("HumanoidRootPart") :: BasePart?
+end
+
+------------------------------------------------------------
+-- API: tryDamage(attacker, target, damage, fromPos)
+-- Return: "parried" | "hit" | "invalid"
+------------------------------------------------------------
+local function tryDamage(attacker: Player, target: Player, damage: number, fromPos: Vector3?)
+	local targetHRP = getHRP(target)
+	local attackerHRP = getHRP(attacker)
+	if not targetHRP or not attackerHRP then return "invalid" end
+
+	local originPos = fromPos or attackerHRP.Position
+
+	-- Range check
+	if (targetHRP.Position - originPos).Magnitude > Config.Combat.ATTACK_RANGE then
+		return "invalid"
+	end
+
+	local now = os.clock()
+
+	-- Parry?
+	if ParryAPI.isParrying(target, now) then
+		if (targetHRP.Position - originPos).Magnitude <= Config.Parry.MAX_DISTANCE then
+			print(("[Parry] %s parry serangan %s"):format(target.Name, attacker.Name))
+			return "parried"
+		end
+	end
+
+	-- Damage
+	local hum = target.Character and target.Character:FindFirstChildOfClass("Humanoid")
+	if hum then
+		hum:TakeDamage(damage)
+	end
+	return "hit"
+end
+
+_G.TryDamage = tryDamage
+
+-- Contoh listener attack (kalau kamu punya remote Attack sendiri)
+-- ReplicatedStorage.Remotes.Attack.OnServerEvent:Connect(function(player, target)
+--     if typeof(target) ~= "Instance" then return end
+--     local targetPlayer = Players:GetPlayerFromCharacter(target)
+--     if targetPlayer then
+--         tryDamage(player, targetPlayer, Config.Combat.BASE_DAMAGE)
+--     end
+-- end)--!strict
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local ProximityPromptService = game:GetService("ProximityPromptService")
+
+local player = Players.LocalPlayer
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local GeneratorAction = Remotes:WaitForChild("GeneratorAction")
+
+local instantMode = false
+
+task.spawn(function()
+	while not _G.ToggleBus do task.wait(0.1) end
+	_G.ToggleBus.Event:Connect(function(feature, state)
+		if feature == "InstantGen" then
+			instantMode = state
+		end
+	end)
+end)
+
+local function interact(part: Instance, action: string)
+	GeneratorAction:FireServer(action, part)
+end
+
+local function setupPrompt(part: Instance)
+	if part:FindFirstChildOfClass("ProximityPrompt") then return end
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.ActionText = "Aktifkan"
+	prompt.ObjectText = "Generator"
+	prompt.HoldDuration = 0
+	prompt.MaxActivationDistance = 10
+	prompt.RequiresLineOfSight = false
+	prompt.Parent = part
+
+	prompt.Triggered:Connect(function()
+		if instantMode then
+			interact(part, "instant")  -- hanya jalan kalau studio + dev
+		else
+			interact(part, "start")
+		end
+	end)
+
+	prompt.TriggerEnded:Connect(function()
+		if not instantMode then
+			interact(part, "stop")
+		end
+	end)
+end
+
+-- Auto-setup untuk semua generator di workspace
+local function scanWorkspace()
+	for _, obj in ipairs(workspace:GetDescendants()) do
+		if obj:IsA("BasePart") and obj:HasTag("Generator") then
+			setupPrompt(obj)
+		end
+	end
+end
+
+scanWorkspace()
+workspace.DescendantAdded:Connect(function(obj)
+	if obj:IsA("BasePart") and obj:HasTag("Generator") then
+		setupPrompt(obj)
+	end
+end)--!strict
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local Config = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Config"))
+local Remotes = ReplicatedStorage:WaitForChild("Remotes")
+local GeneratorAction = Remotes:WaitForChild("GeneratorAction")
+
+type GenState = {
+	progress: number,
+	active: boolean,
+	lastInteractor: Player?,
+}
+local generators: {[Instance]: GenState} = {}
+local lastActionAt: {[Player]: number} = {}
+local REMOTE_RATE = 0.1
+
+local function getHRP(p: Player): BasePart?
+	local c = p.Character
+	if not c then return nil end
+	return c:FindFirstChild("HumanoidRootPart") :: BasePart?
+end
+
+local function inRange(p: Player, target: BasePart, dist: number): boolean
+	local hrp = getHRP(p)
+	if not hrp then return false end
+	return (hrp.Position - target.Position).Magnitude <= dist
+end
+
+local function isDev(player: Player): boolean
+	return Config.DEV_USER_IDS[player.UserId] == true
+end
+
+------------------------------------------------------------
+-- Register generator
+------------------------------------------------------------
+local function register(part: Instance)
+	generators[part] = { progress = 0, active = false, lastInteractor = nil }
+	part:SetAttribute("Progress", 0)
+	part:SetAttribute("Active", false)
+end
+
+for _, obj in ipairs(workspace:GetDescendants()) do
+	if obj:HasTag("Generator") then register(obj) end
+end
+workspace.DescendantAdded:Connect(function(obj)
+	if obj:HasTag("Generator") then register(obj) end
+end)
+
+------------------------------------------------------------
+-- Remote handler
+------------------------------------------------------------
+GeneratorAction.OnServerEvent:Connect(function(player, action, part)
+	-- Validasi tipe
+	if typeof(action) ~= "string" then return end
+	if typeof(part) ~= "Instance" then return end
+	if not part:IsA("BasePart") then return end
+
+	local state = generators[part]
+	if not state then return end
+
+	-- Rate limit
+	local now = os.clock()
+	if now - (lastActionAt[player] or 0) < REMOTE_RATE then return end
+	lastActionAt[player] = now
+
+	-- Range check
+	if not inRange(player, part, Config.Generator.INTERACT_RANGE) then return end
+
+	if action == "start" then
+		if state.active then return end
+		state.active = true
+		state.lastInteractor = player
+		part:SetAttribute("Active", true)
+
+	elseif action == "stop" then
+		if state.lastInteractor ~= player then return end
+		state.active = false
+		state.lastInteractor = nil
+		part:SetAttribute("Active", false)
+
+	elseif action == "instant" then
+		-- ⚡ HANYA di Studio + hanya dev
+		if not RunService:IsStudio() then return end
+		if not isDev(player) then return end
+
+		state.progress = Config.Generator.FINISH_TIME
+		state.active = false
+		state.lastInteractor = nil
+		part:SetAttribute("Progress", Config.Generator.FINISH_TIME)
+		part:SetAttribute("Active", false)
+		print(("[Generator] INSTANT oleh %s"):format(player.Name))
+	end
+end)
+
+------------------------------------------------------------
+-- Loop progres
+------------------------------------------------------------
+task.spawn(function()
+	while true do
+		task.wait(Config.Generator.TICK_RATE)
+
+		for part, state in pairs(generators) do
+			if not part.Parent then
+				generators[part] = nil
+				continue
+			end
+
+			if state.active and state.lastInteractor then
+				-- Interaktor masih dekat?
+				if not inRange(state.lastInteractor, part, Config.Generator.INTERACT_RANGE * 1.5) then
+					state.active = false
+					state.lastInteractor = nil
+					part:SetAttribute("Active", false)
+					continue
+				end
+
+				state.progress = math.min(
+					state.progress + Config.Generator.PROGRESS_PER_TICK,
+					Config.Generator.FINISH_TIME
+				)
+				part:SetAttribute("Progress", state.progress)
+
+				if state.progress >= Config.Generator.FINISH_TIME then
+					state.active = false
+					state.lastInteractor = nil
+					part:SetAttribute("Active", false)
+					print(("[Generator] %s selesai!"):format(part:GetFullName()))
+					-- TODO: reward, buka pintu, dsb.
+				end
+			end
+		end
+	end
+end)--!strict
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local Config = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Config"))
+local player = Players.LocalPlayer
+
+-- Hanya untuk dev (UserId di Config)
+if not Config.DEV_USER_IDS[player.UserId] then
+	return
+end
+
+local enabled = false
+local activeHighlights: {[Instance]: Highlight} = {}
+
+local function addHighlight(instance: Instance, color: Color3)
+	if activeHighlights[instance] then return end
+	local hl = Instance.new("Highlight")
+	hl.Adornee = instance
+	hl.FillColor = color
+	hl.OutlineColor = Color3.new(1, 1, 1)
+	hl.FillTransparency = 0.5
+	hl.OutlineTransparency = 0
+	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	hl.Parent = instance
+	activeHighlights[instance] = hl
+end
+
+local function clearAll()
+	for inst, hl in pairs(activeHighlights) do
+		hl:Destroy()
+		activeHighlights[inst] = nil
+	end
+end
+
+local function scanAndTag()
+	-- Bersihkan yang parent sudah hilang
+	for inst, hl in pairs(activeHighlights) do
+		if not inst.Parent then
+			hl:Destroy()
+			activeHighlights[inst] = nil
+		end
+	end
+
+	for _, obj in ipairs(Workspace:GetDescendants()) do
+		local color = Config.DebugHighlight.COLORS[obj.Name]
+		if color and (obj:IsA("Model") or obj:IsA("BasePart")) then
+			addHighlight(obj, color)
+		end
+	end
+end
+
+-- Dengarkan toggle dari GUI
+task.spawn(function()
+	while not _G.ToggleBus do task.wait(0.1) end
+	_G.ToggleBus.Event:Connect(function(feature, state)
+		if feature == "ESP" then
+			enabled = state
+			if not enabled then
+				clearAll()
+			else
+				scanAndTag()
+			end
+		end
+	end)
+end)
+
+-- Loop refresh kalau aktif
+task.spawn(function()
+	while true do
+		task.wait(2)
+		if enabled then
+			scanAndTag()
+		end
+	end
+end)
